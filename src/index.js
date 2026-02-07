@@ -33,6 +33,29 @@ class Task {
     this.completedAt = null;
     this.model = options.model || null;
     this.permissionMode = options.permissionMode || "default";
+    // Progress tracking
+    this.progressLog = [];    // [{timestamp, type, summary}]
+    this.lastActivity = null; // ISO timestamp of last event
+    this.resultText = "";     // Final assembled output from stream events
+    this._stdoutBuffer = "";  // Buffer for incomplete JSON lines
+  }
+
+  addProgress(type, summary) {
+    const entry = {
+      timestamp: new Date().toISOString(),
+      type,
+      summary,
+    };
+    this.progressLog.push(entry);
+    this.lastActivity = entry.timestamp;
+    // Keep last 50 entries to avoid memory bloat
+    if (this.progressLog.length > 50) {
+      this.progressLog = this.progressLog.slice(-50);
+    }
+  }
+
+  getLatestProgress(count = 3) {
+    return this.progressLog.slice(-count);
   }
 
   toJSON() {
@@ -46,18 +69,143 @@ class Task {
       exitCode: this.exitCode,
       model: this.model,
       permissionMode: this.permissionMode,
-      outputLength: this.stdout.length,
+      outputLength: this.resultText.length || this.stdout.length,
       hasErrors: this.stderr.length > 0,
+      progressEntries: this.progressLog.length,
     };
   }
 }
 
 // ─── Core Functions ──────────────────────────────────────────────────────────
 
+/**
+ * Parse a stream-json event and extract a human-readable progress summary.
+ * Returns {type, summary} or null if the event isn't progress-worthy.
+ */
+function parseProgressEvent(event) {
+  try {
+    switch (event.type) {
+      case "assistant": {
+        // Assistant text message - grab first meaningful line as summary
+        const msg = event.message;
+        if (msg?.type === "text" && msg?.content) {
+          const text = msg.content.trim();
+          if (text.length > 0) {
+            const firstLine = text.split("\n")[0].slice(0, 120);
+            return { type: "thinking", summary: firstLine };
+          }
+        }
+        return null;
+      }
+
+      case "tool_use": {
+        const toolName = event.tool_name || event.name || "unknown_tool";
+        const input = event.input || event.tool_input || {};
+
+        // Format tool-specific summaries
+        switch (toolName) {
+          case "Read":
+          case "View":
+          case "read_file":
+            return { type: "read", summary: `📖 Reading: ${input.file_path || input.path || "file"}` };
+
+          case "Write":
+          case "write_file":
+          case "create_file":
+            return { type: "write", summary: `✏️ Writing: ${input.file_path || input.path || "file"}` };
+
+          case "Edit":
+          case "str_replace":
+          case "edit_file":
+            return { type: "edit", summary: `🔧 Editing: ${input.file_path || input.path || "file"}` };
+
+          case "Bash":
+          case "bash":
+          case "execute_command": {
+            const cmd = (input.command || input.cmd || "").slice(0, 80);
+            return { type: "bash", summary: `⚙️ Running: ${cmd}` };
+          }
+
+          case "List":
+          case "list_directory":
+            return { type: "list", summary: `📁 Listing: ${input.path || input.dir || "directory"}` };
+
+          case "Search":
+          case "search":
+          case "Grep":
+          case "grep":
+            return { type: "search", summary: `🔍 Searching: ${input.pattern || input.query || "..."}` };
+
+          case "Task":
+          case "dispatch_task":
+            return { type: "subtask", summary: `🪖 Spawning sub-agent: ${(input.task || input.description || "").slice(0, 60)}` };
+
+          default:
+            return { type: "tool", summary: `🔨 ${toolName}` };
+        }
+      }
+
+      case "result": {
+        return { type: "result", summary: "✅ Agent finished processing" };
+      }
+
+      default:
+        return null;
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Process incoming stdout data from stream-json format.
+ * Parses newline-delimited JSON and extracts progress events.
+ */
+function processStreamData(task, rawData) {
+  task._stdoutBuffer += rawData;
+
+  // Split on newlines, keeping incomplete last line in buffer
+  const lines = task._stdoutBuffer.split("\n");
+  task._stdoutBuffer = lines.pop() || ""; // Last element may be incomplete
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    try {
+      const event = JSON.parse(trimmed);
+
+      // Accumulate final result text from assistant messages
+      if (event.type === "assistant" && event.message?.type === "text") {
+        task.resultText += event.message.content || "";
+      }
+
+      // Extract result text from result events
+      if (event.type === "result" && event.result) {
+        // Result may contain the final text directly
+        if (typeof event.result === "string") {
+          task.resultText += event.result;
+        } else if (event.result.text) {
+          task.resultText += event.result.text;
+        }
+      }
+
+      // Parse progress
+      const progress = parseProgressEvent(event);
+      if (progress) {
+        task.addProgress(progress.type, progress.summary);
+      }
+    } catch {
+      // Not valid JSON - append to raw stdout as fallback
+      task.stdout += trimmed + "\n";
+    }
+  }
+}
+
 function spawnClaudeAgent(task) {
   const args = [
     "-p", task.description,
-    "--output-format", "text",
+    "--output-format", "stream-json",
   ];
 
   if (task.model) {
@@ -76,9 +224,10 @@ function spawnClaudeAgent(task) {
 
   task.process = proc;
   task.status = "running";
+  task.addProgress("system", "🚀 Agent started");
 
   proc.stdout.on("data", (data) => {
-    task.stdout += data.toString();
+    processStreamData(task, data.toString());
   });
 
   proc.stderr.on("data", (data) => {
@@ -86,10 +235,26 @@ function spawnClaudeAgent(task) {
   });
 
   proc.on("close", (code) => {
+    // Flush any remaining buffer
+    if (task._stdoutBuffer.trim()) {
+      try {
+        const event = JSON.parse(task._stdoutBuffer.trim());
+        const progress = parseProgressEvent(event);
+        if (progress) task.addProgress(progress.type, progress.summary);
+        if (event.type === "assistant" && event.message?.type === "text") {
+          task.resultText += event.message.content || "";
+        }
+      } catch {
+        task.stdout += task._stdoutBuffer;
+      }
+      task._stdoutBuffer = "";
+    }
+
     task.exitCode = code;
     task.status = code === 0 ? "completed" : "failed";
     task.completedAt = new Date().toISOString();
     task.process = null;
+    task.addProgress("system", code === 0 ? "✅ Task completed" : `❌ Task failed (exit code: ${code})`);
   });
 
   proc.on("error", (err) => {
@@ -97,6 +262,7 @@ function spawnClaudeAgent(task) {
     task.stderr += `\nProcess error: ${err.message}`;
     task.completedAt = new Date().toISOString();
     task.process = null;
+    task.addProgress("system", `❌ Process error: ${err.message}`);
   });
 
   return task;
@@ -109,7 +275,7 @@ function getActiveTasks() {
 // ─── MCP Server Setup ────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "claude-army", version: "0.1.0" },
+  { name: "claude-army", version: "0.2.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -305,7 +471,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ? `${((new Date(t.completedAt) - new Date(t.startedAt)) / 1000).toFixed(0)}s`
           : `${((Date.now() - new Date(t.startedAt).getTime()) / 1000).toFixed(0)}s (running)`;
         const project = path.basename(t.workingDir);
-        return `${icon} [${t.id}] ${t.status.toUpperCase()}\n   Project: ${project}\n   Task: ${t.description}\n   Runtime: ${runtime}`;
+
+        let entry = `${icon} [${t.id}] ${t.status.toUpperCase()}\n   Project: ${project}\n   Task: ${t.description}\n   Runtime: ${runtime}`;
+
+        // Show recent progress for running tasks
+        if (t.status === "running") {
+          const recent = t.getLatestProgress(3);
+          if (recent.length > 0) {
+            const progressLines = recent.map((p) => `     → ${p.summary}`).join("\n");
+            entry += `\n   Recent activity:\n${progressLines}`;
+          }
+        }
+
+        return entry;
       }).join("\n\n");
 
       const running = taskList.filter((t) => t.status === "running").length;
@@ -333,7 +511,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-      let output = task.stdout || "(no output yet)";
+      // Prefer assembled result text from stream events, fall back to raw stdout
+      let output = task.resultText || task.stdout || "(no output yet)";
       if (args.tail_lines && args.tail_lines > 0) {
         const lines = output.split("\n");
         output = lines.slice(-args.tail_lines).join("\n");
@@ -341,12 +520,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       const errOutput = task.stderr ? `\n\n⚠️ Stderr:\n${task.stderr}` : "";
 
+      // Build progress timeline
+      let timeline = "";
+      if (task.progressLog.length > 0) {
+        const entries = task.progressLog.map((p) => {
+          const elapsed = ((new Date(p.timestamp) - new Date(task.startedAt)) / 1000).toFixed(0);
+          return `  [${elapsed}s] ${p.summary}`;
+        }).join("\n");
+        timeline = `\n─── Progress Timeline ───\n${entries}\n`;
+      }
+
       return {
         content: [{
           type: "text",
           text: `📄 Output for task ${args.task_id} [${task.status}]\n` +
             `Project: ${path.basename(task.workingDir)}\n` +
-            `Task: ${task.description}\n\n` +
+            `Task: ${task.description}\n` +
+            `${timeline}\n` +
             `─── Agent Output ───\n${output}${errOutput}`,
         }],
       };
