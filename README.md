@@ -1,5 +1,7 @@
 # 🪖 ClaudeArmy
 
+![Version](https://img.shields.io/badge/version-0.1.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Node](https://img.shields.io/badge/node-18%2B-brightgreen)
+
 An MCP server that lets Claude orchestrate multiple Claude Code agents working autonomously across different projects.
 
 ## What It Does
@@ -62,6 +64,15 @@ Edit the constants at the top of `src/index.js`:
 - Claude Code installed and authenticated
 - Node.js 18+
 - Claude Desktop or any MCP-compatible client
+
+## Changelog
+
+### v0.1.0
+- Initial release
+- Core tools: dispatch_task, check_tasks, get_task_output, cancel_task, purge_tasks
+- Fire-and-forget architecture with background process management
+- Max 5 concurrent agents
+- stdio transport for MCP communication
 
 ## License
 
