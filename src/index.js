@@ -300,15 +300,53 @@ function spawnClaudeAgent(task) {
     task.status = code === 0 ? "completed" : "failed";
     task.completedAt = new Date().toISOString();
     task.process = null;
-    task.addProgress("system", code === 0 ? "✅ Task completed" : `❌ Task failed (exit code: ${code})`);
+
+    if (code === 0) {
+      task.addProgress("system", "✅ Task completed");
+    } else {
+      // Build a failure summary with context
+      let failMsg = `❌ Task failed (exit code: ${code})`;
+
+      // Include last few progress entries for context
+      const recentProgress = task.getLatestProgress(5);
+      if (recentProgress.length > 0) {
+        const progressContext = recentProgress.map((p) => `  → ${p.summary}`).join("\n");
+        failMsg += `\nLast activity before failure:\n${progressContext}`;
+      }
+
+      // Include a snippet of stderr if available
+      if (task.stderr.trim()) {
+        const stderrLines = task.stderr.trim().split("\n");
+        const stderrSnippet = stderrLines.slice(-10).join("\n");
+        failMsg += `\nStderr (last ${Math.min(stderrLines.length, 10)} lines):\n${stderrSnippet}`;
+      }
+
+      task.addProgress("system", failMsg);
+    }
   });
 
   proc.on("error", (err) => {
     task.status = "failed";
-    task.stderr += `\nProcess error: ${err.message}`;
     task.completedAt = new Date().toISOString();
     task.process = null;
-    task.addProgress("system", `❌ Process error: ${err.message}`);
+
+    let guidance;
+    switch (err.code) {
+      case "ENOENT":
+        guidance = `Claude Code CLI not found. Make sure 'claude' is installed and on your PATH. Install it with: npm install -g @anthropic-ai/claude-code`;
+        break;
+      case "EACCES":
+        guidance = `Permission denied when running '${CLAUDE_BINARY}'. Check file permissions with: ls -la $(which claude)`;
+        break;
+      case "EMFILE":
+        guidance = `Too many open files. Try closing other programs or raising your system's file descriptor limit (ulimit -n).`;
+        break;
+      default:
+        guidance = `Process error: ${err.message} (code: ${err.code || "unknown"})`;
+    }
+
+    task.stderr += `\n${guidance}`;
+    task.addProgress("system", `❌ ${guidance}`);
   });
 
   return task;
@@ -316,6 +354,21 @@ function spawnClaudeAgent(task) {
 
 function getActiveTasks() {
   return [...tasks.values()].filter((t) => t.status === "running");
+}
+
+/**
+ * Format a duration in milliseconds as a human-readable string.
+ * e.g. 15400 → "15s", 192000 → "3m 12s", 3661000 → "1h 1m 1s"
+ */
+function formatDuration(ms) {
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
 }
 
 // ─── MCP Server Setup ────────────────────────────────────────────────────────
@@ -454,7 +507,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{
             type: "text",
-            text: `❌ Directory not found: ${workDir}`,
+            text: `❌ Directory not found: ${workDir}\n\nCheck the path for typos. The working_directory must be an absolute path to an existing directory (e.g. /home/user/my-project).`,
           }],
         };
       }
@@ -520,8 +573,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         let entry = `${icon} [${t.id}] ${t.status.toUpperCase()}\n   Project: ${project}\n   Task: ${t.description}\n   Runtime: ${runtime}`;
 
-        // Show recent progress for running tasks
+        // Show idle time and recent progress for running tasks
         if (t.status === "running") {
+          if (t.lastActivity) {
+            const idleMs = Date.now() - new Date(t.lastActivity).getTime();
+            entry += `\n   Last activity: ${formatDuration(idleMs)} ago`;
+          } else {
+            entry += `\n   Last activity: Waiting for first activity...`;
+          }
+
           const recent = t.getLatestProgress(3);
           if (recent.length > 0) {
             const progressLines = recent.map((p) => `     → ${p.summary}`).join("\n");
