@@ -206,6 +206,7 @@ function spawnClaudeAgent(task) {
   const args = [
     "-p", task.description,
     "--output-format", "stream-json",
+    "--verbose",
   ];
 
   if (task.model) {
