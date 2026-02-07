@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.robbhimself-1337/claude-army",
+  "description": "Orchestrate multiple Claude Code agents in parallel from chat",
+  "repository": {
+    "url": "https://github.com/robbhimself-1337/claude-army",
+    "source": "github"
+  },
+  "version": "0.3.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "claude-army",
+      "version": "0.3.1",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

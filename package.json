@@ -1,6 +1,7 @@
 {
   "name": "claude-army",
-  "version": "0.3.0",
+  "mcpName": "io.github.robbhimself-1337/claude-army",
+  "version": "0.3.1",
   "description": "MCP server for orchestrating Claude Code agents across multiple projects",
   "type": "module",
   "main": "src/index.js",
