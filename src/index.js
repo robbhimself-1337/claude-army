@@ -79,70 +79,93 @@ class Task {
 // ─── Core Functions ──────────────────────────────────────────────────────────
 
 /**
+ * Parse a tool_use content block into a progress entry.
+ * Reusable for tool_use blocks found inside assistant message content arrays
+ * and for top-level tool_use events.
+ */
+function parseToolUseBlock(block) {
+  const toolName = block.name || "unknown_tool";
+  const input = block.input || {};
+
+  switch (toolName) {
+    case "Read":
+    case "View":
+    case "read_file":
+      return { type: "read", summary: `📖 Reading: ${input.file_path || input.path || "file"}` };
+
+    case "Write":
+    case "write_file":
+    case "create_file":
+      return { type: "write", summary: `✏️ Writing: ${input.file_path || input.path || "file"}` };
+
+    case "Edit":
+    case "str_replace":
+    case "edit_file":
+      return { type: "edit", summary: `🔧 Editing: ${input.file_path || input.path || "file"}` };
+
+    case "Bash":
+    case "bash":
+    case "execute_command": {
+      const cmd = (input.command || input.cmd || "").slice(0, 80);
+      return { type: "bash", summary: `⚙️ Running: ${cmd}` };
+    }
+
+    case "List":
+    case "list_directory":
+      return { type: "list", summary: `📁 Listing: ${input.path || input.dir || "directory"}` };
+
+    case "Search":
+    case "search":
+    case "Grep":
+    case "grep":
+      return { type: "search", summary: `🔍 Searching: ${input.pattern || input.query || "..."}` };
+
+    case "Task":
+    case "dispatch_task":
+      return { type: "subtask", summary: `🪖 Spawning sub-agent: ${(input.task || input.description || "").slice(0, 60)}` };
+
+    default:
+      return { type: "tool", summary: `🔨 ${toolName}` };
+  }
+}
+
+/**
  * Parse a stream-json event and extract a human-readable progress summary.
- * Returns {type, summary} or null if the event isn't progress-worthy.
+ * Returns {type, summary}, an array of {type, summary}, or null if the event isn't progress-worthy.
  */
 function parseProgressEvent(event) {
   try {
     switch (event.type) {
       case "assistant": {
-        // Assistant text message - grab first meaningful line as summary
+        // Assistant message — content is an array of blocks
         const msg = event.message;
-        if (msg?.type === "text" && msg?.content) {
-          const text = msg.content.trim();
-          if (text.length > 0) {
-            const firstLine = text.split("\n")[0].slice(0, 120);
-            return { type: "thinking", summary: firstLine };
+        if (msg?.type !== "message" || !Array.isArray(msg?.content)) return null;
+
+        const results = [];
+
+        for (const block of msg.content) {
+          if (block.type === "text" && block.text) {
+            const text = block.text.trim();
+            if (text.length > 0) {
+              const firstLine = text.split("\n")[0].slice(0, 120);
+              results.push({ type: "thinking", summary: firstLine });
+            }
+          } else if (block.type === "tool_use") {
+            // tool_use blocks are nested inside assistant message content
+            const toolProgress = parseToolUseBlock(block);
+            if (toolProgress) results.push(toolProgress);
           }
         }
-        return null;
+
+        return results.length > 0 ? results : null;
       }
 
       case "tool_use": {
-        const toolName = event.tool_name || event.name || "unknown_tool";
-        const input = event.input || event.tool_input || {};
-
-        // Format tool-specific summaries
-        switch (toolName) {
-          case "Read":
-          case "View":
-          case "read_file":
-            return { type: "read", summary: `📖 Reading: ${input.file_path || input.path || "file"}` };
-
-          case "Write":
-          case "write_file":
-          case "create_file":
-            return { type: "write", summary: `✏️ Writing: ${input.file_path || input.path || "file"}` };
-
-          case "Edit":
-          case "str_replace":
-          case "edit_file":
-            return { type: "edit", summary: `🔧 Editing: ${input.file_path || input.path || "file"}` };
-
-          case "Bash":
-          case "bash":
-          case "execute_command": {
-            const cmd = (input.command || input.cmd || "").slice(0, 80);
-            return { type: "bash", summary: `⚙️ Running: ${cmd}` };
-          }
-
-          case "List":
-          case "list_directory":
-            return { type: "list", summary: `📁 Listing: ${input.path || input.dir || "directory"}` };
-
-          case "Search":
-          case "search":
-          case "Grep":
-          case "grep":
-            return { type: "search", summary: `🔍 Searching: ${input.pattern || input.query || "..."}` };
-
-          case "Task":
-          case "dispatch_task":
-            return { type: "subtask", summary: `🪖 Spawning sub-agent: ${(input.task || input.description || "").slice(0, 60)}` };
-
-          default:
-            return { type: "tool", summary: `🔨 ${toolName}` };
-        }
+        // Top-level tool_use events — delegate to shared helper
+        return parseToolUseBlock({
+          name: event.tool_name || event.name,
+          input: event.input || event.tool_input || {},
+        });
       }
 
       case "result": {
@@ -176,24 +199,34 @@ function processStreamData(task, rawData) {
       const event = JSON.parse(trimmed);
 
       // Accumulate final result text from assistant messages
-      if (event.type === "assistant" && event.message?.type === "text") {
-        task.resultText += event.message.content || "";
-      }
-
-      // Extract result text from result events
-      if (event.type === "result" && event.result) {
-        // Result may contain the final text directly
-        if (typeof event.result === "string") {
-          task.resultText += event.result;
-        } else if (event.result.text) {
-          task.resultText += event.result.text;
+      if (event.type === "assistant" && event.message?.type === "message") {
+        const content = event.message.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === "text" && block.text) {
+              task.resultText += block.text;
+            }
+          }
         }
       }
 
-      // Parse progress
+      // Extract result text from result events (only if we haven't
+      // already captured text from assistant messages, to avoid duplication)
+      if (event.type === "result" && event.result && !task.resultText) {
+        if (typeof event.result === "string") {
+          task.resultText = event.result;
+        } else if (event.result.text) {
+          task.resultText = event.result.text;
+        }
+      }
+
+      // Parse progress (may return a single entry, an array, or null)
       const progress = parseProgressEvent(event);
       if (progress) {
-        task.addProgress(progress.type, progress.summary);
+        const entries = Array.isArray(progress) ? progress : [progress];
+        for (const entry of entries) {
+          task.addProgress(entry.type, entry.summary);
+        }
       }
     } catch {
       // Not valid JSON - append to raw stdout as fallback
@@ -241,9 +274,21 @@ function spawnClaudeAgent(task) {
       try {
         const event = JSON.parse(task._stdoutBuffer.trim());
         const progress = parseProgressEvent(event);
-        if (progress) task.addProgress(progress.type, progress.summary);
-        if (event.type === "assistant" && event.message?.type === "text") {
-          task.resultText += event.message.content || "";
+        if (progress) {
+          const entries = Array.isArray(progress) ? progress : [progress];
+          for (const entry of entries) {
+            task.addProgress(entry.type, entry.summary);
+          }
+        }
+        if (event.type === "assistant" && event.message?.type === "message") {
+          const content = event.message.content;
+          if (Array.isArray(content)) {
+            for (const block of content) {
+              if (block.type === "text" && block.text) {
+                task.resultText += block.text;
+              }
+            }
+          }
         }
       } catch {
         task.stdout += task._stdoutBuffer;
