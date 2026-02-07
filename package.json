@@ -1,0 +1,20 @@
+{
+  "name": "claude-army",
+  "version": "0.1.0",
+  "description": "MCP server for orchestrating Claude Code agents across multiple projects",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "claude-army": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  },
+  "keywords": ["mcp", "claude", "claude-code", "agent", "orchestration"],
+  "license": "MIT",
+  "author": "robbhimself"
+}
