@@ -1,8 +1,10 @@
 # 🪖 ClaudeArmy
 
-![Version](https://img.shields.io/badge/version-0.2.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Node](https://img.shields.io/badge/node-18%2B-brightgreen)
+![Version](https://img.shields.io/badge/version-0.3.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Node](https://img.shields.io/badge/node-18%2B-brightgreen)
 
 An MCP server that lets Claude orchestrate multiple Claude Code agents working autonomously across different projects.
+
+![ClaudeArmy Demo](demo.gif)
 
 ## What It Does
 
@@ -66,6 +68,13 @@ Edit the constants at the top of `src/index.js`:
 - Claude Desktop or any MCP-compatible client
 
 ## Changelog
+
+### v0.3.0
+- Fixed stream-json parsing to correctly handle assistant message content arrays
+- Staleness indicator: `check_tasks` now shows time since last agent activity
+- Better error surfacing: actionable messages for CLI not found, permission denied, and mid-run failures
+- Fixed output duplication in `get_task_output`
+- Demo GIF added to README
 
 ### v0.2.0
 - Real-time progress tracking via Claude Code's stream-json output

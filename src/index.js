@@ -374,7 +374,7 @@ function formatDuration(ms) {
 // ─── MCP Server Setup ────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "claude-army", version: "0.2.0" },
+  { name: "claude-army", version: "0.3.0" },
   { capabilities: { tools: {} } }
 );
 

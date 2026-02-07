@@ -1,6 +1,6 @@
 {
   "name": "claude-army",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server for orchestrating Claude Code agents across multiple projects",
   "type": "module",
   "main": "src/index.js",
