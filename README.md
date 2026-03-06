@@ -1,6 +1,6 @@
 # 🪖 ClaudeArmy
 
-![Version](https://img.shields.io/badge/version-0.4.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Node](https://img.shields.io/badge/node-18%2B-brightgreen)
+![Version](https://img.shields.io/badge/version-0.4.1-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Node](https://img.shields.io/badge/node-18%2B-brightgreen)
 
 An MCP server that lets Claude orchestrate multiple Claude Code agents working autonomously across different projects.
 
@@ -89,6 +89,10 @@ Edit the constants at the top of `src/index.js`:
 - Claude Desktop or any MCP-compatible client
 
 ## Changelog
+
+### v0.4.1
+- Bump `@modelcontextprotocol/sdk` to ^1.26.0, resolving 3 high severity supply chain vulnerabilities
+- Add `repository` field to package.json
 
 ### v0.4.0
 - Agent team support: track sub-agents spawned via Claude Code Task tool
