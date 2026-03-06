@@ -1,6 +1,9 @@
 node_modules/
 .env
 *.log
-
 .mcpregistry_github_token
 .mcpregistry_registry_token
+*.local
+.DS_Store
+dist/
+coverage/

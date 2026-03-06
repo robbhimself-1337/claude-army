@@ -12,7 +12,8 @@ import { existsSync } from "fs";
 import path from "path";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
-const CLAUDE_BINARY = "claude";
+const IS_WINDOWS = process.platform === "win32";
+const CLAUDE_BINARY = IS_WINDOWS ? "claude.cmd" : "claude";
 const MAX_CONCURRENT_TASKS = 5;
 const OUTPUT_POLL_INTERVAL_MS = 500;
 
@@ -38,6 +39,9 @@ class Task {
     this.lastActivity = null; // ISO timestamp of last event
     this.resultText = "";     // Final assembled output from stream events
     this._stdoutBuffer = "";  // Buffer for incomplete JSON lines
+    // Sub-agent tracking
+    this.subAgents = [];
+    this._pendingTaskTools = new Map();
   }
 
   addProgress(type, summary) {
@@ -56,6 +60,31 @@ class Task {
 
   getLatestProgress(count = 3) {
     return this.progressLog.slice(-count);
+  }
+
+  addSubAgent(toolUseId, description) {
+    const subAgent = {
+      id: `sub-${this.subAgents.length + 1}`,
+      toolUseId,
+      description: (description || "Unknown task").slice(0, 120),
+      status: "running",
+      dispatchedAt: new Date().toISOString(),
+      completedAt: null,
+      outputPreview: null,
+    };
+    this.subAgents.push(subAgent);
+    this._pendingTaskTools.set(toolUseId, subAgent);
+    return subAgent;
+  }
+
+  completeSubAgent(toolUseId, output) {
+    const subAgent = this._pendingTaskTools.get(toolUseId);
+    if (!subAgent) return null;
+    subAgent.status = "completed";
+    subAgent.completedAt = new Date().toISOString();
+    subAgent.outputPreview = output ? String(output).slice(0, 300) : null;
+    this._pendingTaskTools.delete(toolUseId);
+    return subAgent;
   }
 
   toJSON() {
@@ -228,6 +257,38 @@ function processStreamData(task, rawData) {
           task.addProgress(entry.type, entry.summary);
         }
       }
+
+      // BLOCK A — Detect sub-agent dispatch in assistant messages
+      if (event.type === "assistant" && event.message?.type === "message" && Array.isArray(event.message?.content)) {
+        for (const block of event.message.content) {
+          if (block.type === "tool_use" && block.name === "Task" && block.id) {
+            const desc = block.input?.description || block.input?.task || "Unknown task";
+            const sub = task.addSubAgent(block.id, desc);
+            task.addProgress("subtask_dispatch", `🪖 ${sub.id} deployed: ${desc.slice(0, 60)}`);
+          }
+        }
+      }
+
+      // BLOCK B — Handle tool results coming back from sub-agents
+      if (event.type === "user" && Array.isArray(event.message?.content)) {
+        for (const block of event.message.content) {
+          if (block.type === "tool_result" && block.tool_use_id && task._pendingTaskTools.has(block.tool_use_id)) {
+            let output = "";
+            if (typeof block.content === "string") {
+              output = block.content;
+            } else if (Array.isArray(block.content)) {
+              output = block.content
+                .filter((b) => b.type === "text" && b.text)
+                .map((b) => b.text)
+                .join("\n");
+            }
+            const sub = task.completeSubAgent(block.tool_use_id, output);
+            if (sub) {
+              task.addProgress("subtask_complete", `✅ ${sub.id} finished: ${sub.description.slice(0, 60)}`);
+            }
+          }
+        }
+      }
     } catch {
       // Not valid JSON - append to raw stdout as fallback
       task.stdout += trimmed + "\n";
@@ -333,7 +394,7 @@ function spawnClaudeAgent(task) {
     let guidance;
     switch (err.code) {
       case "ENOENT":
-        guidance = `Claude Code CLI not found. Make sure 'claude' is installed and on your PATH. Install it with: npm install -g @anthropic-ai/claude-code`;
+        guidance = `Claude Code CLI not found. Make sure 'claude' is installed and on your PATH. Verify with: ${IS_WINDOWS ? "where claude" : "which claude"}\nInstall it with: npm install -g @anthropic-ai/claude-code`;
         break;
       case "EACCES":
         guidance = `Permission denied when running '${CLAUDE_BINARY}'. Check file permissions with: ls -la $(which claude)`;
@@ -374,7 +435,7 @@ function formatDuration(ms) {
 // ─── MCP Server Setup ────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "claude-army", version: "0.3.0" },
+  { name: "claude-army", version: "0.4.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -410,6 +471,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             enum: ["default", "acceptEdits", "plan", "bypassPermissions"],
             description: "Permission mode for the agent. 'acceptEdits' auto-approves file edits. 'bypassPermissions' skips all checks (use carefully).",
+          },
+          mode: {
+            type: "string",
+            enum: ["solo", "team"],
+            description: "'solo' (default) runs a single agent. 'team' instructs the lead agent to decompose the task and spawn specialized sub-agents that work in parallel, then synthesize results.",
           },
         },
         required: ["task", "working_directory"],
@@ -481,6 +547,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: "get_agent_team",
+      description:
+        "Get a detailed view of a lead agent and all sub-agents it has spawned. " +
+        "Use this when a task is using Claude Code agent teams to see the full picture " +
+        "of what each sub-agent is doing, their status, and output previews. " +
+        "More detailed than check_tasks for multi-agent operations.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          task_id: {
+            type: "string",
+            description: "The task ID of the lead agent",
+          },
+        },
+        required: ["task_id"],
+      },
+    },
   ],
 }));
 
@@ -513,7 +597,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       const taskId = randomUUID().split("-")[0]; // Short ID
-      const task = new Task(taskId, args.task, workDir, {
+      let taskDescription = args.task;
+
+      if (args.mode === "team") {
+        taskDescription =
+          "You are the lead agent coordinating a team. Your job is to:\n" +
+          "1. Analyze the task and break it into parallel subtasks\n" +
+          "2. Use the Task tool to spawn specialized sub-agents for each subtask\n" +
+          "3. Each sub-agent should have a focused, well-defined scope\n" +
+          "4. Wait for all sub-agents to complete, then synthesize their results into a cohesive outcome\n\n" +
+          `Original task: ${args.task}`;
+      }
+
+      const task = new Task(taskId, taskDescription, workDir, {
         model: args.model,
         permissionMode: args.permission_mode,
       });
@@ -522,14 +618,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       spawnClaudeAgent(task);
 
       const projectName = path.basename(workDir);
+      const modeLabel = args.mode === "team" ? " (team mode)" : "";
       return {
         content: [{
           type: "text",
-          text: `🚀 Agent deployed!\n\n` +
+          text: `🚀 Agent deployed!${modeLabel}\n\n` +
             `• Task ID: ${taskId}\n` +
             `• Project: ${projectName} (${workDir})\n` +
             `• Mission: ${args.task}\n` +
             `• Model: ${args.model || "default"}\n` +
+            `• Mode: ${args.mode || "solo"}\n` +
             `• Permissions: ${args.permission_mode || "default"}\n\n` +
             `Agent is now working autonomously. Do NOT poll or monitor this task — return to the conversation immediately. The user will ask you to check progress when they want an update.`,
         }],
@@ -587,6 +685,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const progressLines = recent.map((p) => `     → ${p.summary}`).join("\n");
             entry += `\n   Recent activity:\n${progressLines}`;
           }
+        }
+
+        if (t.subAgents.length > 0) {
+          const subRunning = t.subAgents.filter((s) => s.status === "running").length;
+          const subCompleted = t.subAgents.filter((s) => s.status === "completed").length;
+          entry += `\n   Agent team: ${t.subAgents.length} sub-agents (${subRunning} running, ${subCompleted} completed)`;
         }
 
         return entry;
@@ -670,13 +774,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       if (task.process) {
-        task.process.kill("SIGTERM");
-        // Give it 5s then SIGKILL
-        setTimeout(() => {
-          if (task.process) {
-            task.process.kill("SIGKILL");
-          }
-        }, 5000);
+        if (IS_WINDOWS) {
+          task.process.kill();
+        } else {
+          task.process.kill("SIGTERM");
+          setTimeout(() => {
+            if (task.process) {
+              task.process.kill("SIGKILL");
+            }
+          }, 5000);
+        }
       }
 
       task.status = "cancelled";
@@ -700,7 +807,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       for (const [id, task] of tasks) {
         if (task.status === "running" || task.status === "starting") {
           if (includeRunning) {
-            if (task.process) task.process.kill("SIGTERM");
+            if (task.process) {
+              if (IS_WINDOWS) {
+                task.process.kill();
+              } else {
+                task.process.kill("SIGTERM");
+              }
+            }
             tasks.delete(id);
             purged++;
           }
@@ -715,6 +828,74 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           type: "text",
           text: `🧹 Purged ${purged} task(s). ${tasks.size} remaining.`,
         }],
+      };
+    }
+
+    // ── get_agent_team ────────────────────────────────────────────────────
+    case "get_agent_team": {
+      const task = tasks.get(args.task_id);
+      if (!task) {
+        return {
+          content: [{
+            type: "text",
+            text: `❌ Task not found: ${args.task_id}`,
+          }],
+        };
+      }
+
+      const statusIcons = {
+        starting: "🔄",
+        running: "⚡",
+        completed: "✅",
+        failed: "❌",
+        cancelled: "🛑",
+      };
+
+      const now = Date.now();
+      const leadIcon = statusIcons[task.status] || "❓";
+      const leadRuntime = task.completedAt
+        ? formatDuration(new Date(task.completedAt) - new Date(task.startedAt))
+        : formatDuration(now - new Date(task.startedAt).getTime());
+      const lastAct = task.lastActivity
+        ? `${formatDuration(now - new Date(task.lastActivity).getTime())} ago`
+        : "N/A";
+
+      let text = `🪖 Agent Team for task [${task.id}]\n\n`;
+      text += `── Lead Agent ──\n`;
+      text += `${leadIcon} Status: ${task.status.toUpperCase()}\n`;
+      text += `   Project: ${path.basename(task.workingDir)}\n`;
+      text += `   Task: ${task.description}\n`;
+      text += `   Runtime: ${leadRuntime}\n`;
+      text += `   Last activity: ${lastAct}\n`;
+
+      if (task.subAgents.length > 0) {
+        text += `\n── Sub-Agents (${task.subAgents.length}) ──\n`;
+        for (const sub of task.subAgents) {
+          const subIcon = statusIcons[sub.status] || "❓";
+          const subRuntime = sub.completedAt
+            ? formatDuration(new Date(sub.completedAt) - new Date(sub.dispatchedAt))
+            : formatDuration(now - new Date(sub.dispatchedAt).getTime());
+          text += `\n${subIcon} [${sub.id}] ${sub.status.toUpperCase()} (${subRuntime})\n`;
+          text += `   Task: ${sub.description}\n`;
+          if (sub.status === "completed" && sub.outputPreview) {
+            text += `   Output: ${sub.outputPreview}\n`;
+          }
+        }
+      } else {
+        text += `\n── Sub-Agents ──\nNo sub-agents spawned yet.\n`;
+      }
+
+      const recentProgress = task.getLatestProgress(5);
+      if (recentProgress.length > 0) {
+        text += `\n── Recent Progress ──\n`;
+        for (const p of recentProgress) {
+          const elapsed = ((new Date(p.timestamp) - new Date(task.startedAt)) / 1000).toFixed(0);
+          text += `  [${elapsed}s] ${p.summary}\n`;
+        }
+      }
+
+      return {
+        content: [{ type: "text", text }],
       };
     }
 
