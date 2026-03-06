@@ -13,9 +13,13 @@
     "dev": "node --watch src/index.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1"
+    "@modelcontextprotocol/sdk": "^1.26.0"
   },
   "keywords": ["mcp", "claude", "claude-code", "agent", "orchestration"],
   "license": "MIT",
-  "author": "robbhimself"
+  "author": "robbhimself",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/robbhimself-1337/claude-army.git"
+  }
 }
